@@ -74,6 +74,9 @@ import qualified Data.ByteString.Builder as B
 import qualified Data.Scientific as Sci
 import Data.Aeson.Parser.Unescape (unescapeText)
 import Data.Aeson.Internal.Text
+import Data.Map.Strict (Map, lookup, insert)
+import Control.Concurrent.STM (TVar, newTVarIO, writeTVar, readTVar, atomically)
+import GHC.IO.Unsafe (unsafePerformIO)
 
 -- $setup
 -- >>> :set -XOverloadedStrings
@@ -386,10 +389,17 @@ jstring = A.word8 W8_DOUBLE_QUOTE *> jstring_
 key :: Parser Key
 key = Key.fromText <$> jstring
 
+
+-- | This cache is used to deduplicate (share) all the `Text` values generated
+-- by 'jstring'.
+theCache :: TVar (Map Text Text)
+{-# NOINLINE theCache #-}
+theCache = unsafePerformIO $ newTVarIO mempty
+
 -- | Parse a string without a leading quote.
 jstring_ :: Parser Text
 {-# INLINE jstring_ #-}
-jstring_ = do
+jstring_ = cacheText $ do
   s <- A.takeWhile (\w -> w /= W8_DOUBLE_QUOTE && w /= W8_BACKSLASH && w >= 0x20 && w < 0x80)
   mw <- A.peekWord8
   case mw of
@@ -397,6 +407,24 @@ jstring_ = do
     Just W8_DOUBLE_QUOTE -> A.anyWord8 $> unsafeDecodeASCII s
     Just w | w < 0x20    -> fail "unescaped control character"
     _                    -> jstringSlow s
+
+-- | From a parser of 'Text', returns the same parser, but all the returned
+-- 'Text' value will be shared when equal.
+cacheText :: Parser Text -> Parser Text
+cacheText p = do
+  -- apply the parser
+  t <- p
+
+  pure $ unsafePerformIO $ atomically $ do
+               c <- readTVar theCache
+               case Data.Map.Strict.lookup t c of
+                 -- The value is in cache, discard the new value and return the one from cache
+                 Just t' -> do
+                   pure t'
+                 -- The value is not in cache, save it
+                 Nothing -> do
+                   writeTVar theCache (Data.Map.Strict.insert t t c)
+                   pure t
 
 jstringSlow :: B.ByteString -> Parser Text
 {-# INLINE jstringSlow #-}
